@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: skydesk
+    runtime: docker
+    plan: free
+    envVars:
+      - key: VNC_PASSWORD
+        generateValue: true
+      - key: PORT
+        value: "6080"
