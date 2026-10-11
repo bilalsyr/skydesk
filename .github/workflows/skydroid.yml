@@ -1,0 +1,100 @@
+# SkyDroid — full Android phone inside GitHub Actions, streamed to your browser.
+#
+# Run from the Actions tab (workflow_dispatch). The job:
+#   1. loads binder_linux (redroid needs it)
+#   2. tunes TCP (BBR + fq + notsent_lowat, no slow-start-after-idle)
+#   3. builds & starts the 3-service compose stack
+#   4. waits for Android boot (sys.boot_completed=1)
+#   5. optionally installs an APK/XAPK from the apk_url input
+#   6. opens a cloudflared quick tunnel and prints the public URL
+#   7. sleeps until the 350-minute job timeout
+#
+# LIMITS (honest): ~5h50m max per run. GitHub free = 2000 Actions minutes/month
+# (~5 full sessions). ALL Android data is wiped when the job ends.
+
+name: SkyDroid
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'رابط APK أو XAPK لتثبيته تلقائيًا بعد الإقلاع (اختياري)'
+        required: false
+        default: ''
+
+jobs:
+  skydroid:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: تحميل binder_linux (مطلوب لـ redroid)
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)"
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
+          if [ ! -e /dev/binder ]; then
+            echo "::error::فشل تحميل binder_linux — لا يمكن تشغيل redroid على هذا الـ runner"
+            echo "Binder check FAILED: /dev/binder missing after modprobe."
+            echo "This runner image cannot host redroid. Try re-running (new runner) later."
+            exit 1
+          fi
+          echo "binder OK:"; ls -l /dev/binder*
+
+      - name: ضبط الشبكة (BBR + fq + low latency)
+        run: |
+          sudo sysctl -w net.core.default_qdisc=fq
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
+          sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+          sudo sysctl -w net.ipv4.tcp_notsent_lowat=16384
+
+      - name: بناء وتشغيل SkyDroid
+        run: |
+          set -e
+          PASS="${{ secrets.SKY_PASS }}"
+          if [ -z "$PASS" ]; then PASS="skydroid"; fi
+          HASH="$(docker run --rm caddy:2-alpine caddy hash-password --plaintext "$PASS")"
+          printf 'SKY_HASH=%s\n' "$HASH" > .env
+          docker compose up -d --build
+          docker compose ps
+
+      - name: انتظار إقلاع أندرويد (sys.boot_completed=1)
+        run: |
+          echo "بانتظار إقلاع أندرويد ..."
+          for i in $(seq 1 120); do
+            BOOT="$(docker compose exec -T scrcpy adb -s android:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)"
+            if [ "$BOOT" = "1" ]; then
+              echo "Android booted ✓"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::انتهت المهلة (10 دقائق) بانتظار إقلاع أندرويد"
+          docker compose logs --tail=100 scrcpy || true
+          exit 1
+
+      - name: تثبيت APK/XAPK (اختياري)
+        if: ${{ inputs.apk_url != '' }}
+        run: |
+          docker compose exec -T scrcpy /opt/install-apk.sh "${{ inputs.apk_url }}"
+
+      - name: فتح نفق cloudflared وطباعة الرابط
+        run: |
+          set -e
+          curl -fSL -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cloudflared
+          /tmp/cloudflared tunnel --url http://localhost:80 --protocol http2 > tunnel.log 2>&1 &
+          URL=""
+          for i in $(seq 1 90); do
+            URL="$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare.com' tunnel.log | head -1 || true)"
+            if [ -n "$URL" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$URL" ]; then
+            echo "::error::تعذر الحصول على رابط النفق"
+            tail -50 tunnel.log || true
+            exit 1
