@@ -1,0 +1,21 @@
+{
+  "background_color": "#000000",
+  "description": "هاتف أندرويد سحابي في متصفحك",
+  "dir": "rtl",
+  "display": "fullscreen",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ],
+  "lang": "ar",
+  "name": "سكاي درويد (SkyDroid)",
+  "orientation": "portrait",
+  "scope": "/play/",
+  "short_name": "SkyDroid",
+  "start_url": "/play/",
+  "theme_color": "#000000"
+}

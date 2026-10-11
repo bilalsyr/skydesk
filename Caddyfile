@@ -1,0 +1,56 @@
+# SkyDroid reverse proxy.
+# Public entry point. Everything is behind basic auth (admin / $SKY_PASS),
+# except /healthz which is used by the Docker healthcheck.
+
+{
+	admin off
+}
+
+:80 {
+	encode gzip zstd
+
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	handle /play/* {
+		basicauth {
+			admin {$SKY_HASH}
+		}
+		uri strip_prefix /play
+		root * /srv/play
+		file_server
+	}
+
+	# tiny device api (keys, screenshot, ping, stream restart)
+	handle /api/* {
+		basicauth {
+			admin {$SKY_HASH}
+		}
+		reverse_proxy scrcpy:8001
+	}
+
+	# ws-scrcpy web client + websocket (NOT path-stripped: the server
+	# reads the action from the query string, and serves its UI under /s
+	# via WS_SCRCPY_PATHNAME=/s)
+	handle /s/* {
+		basicauth {
+			admin {$SKY_HASH}
+		}
+		reverse_proxy scrcpy:8000
+	}
+
+	handle / {
+		basicauth {
+			admin {$SKY_HASH}
+		}
+		redir /play/ 302
+	}
+
+	handle {
+		basicauth {
+			admin {$SKY_HASH}
+		}
+		reverse_proxy scrcpy:8000
+	}
+}

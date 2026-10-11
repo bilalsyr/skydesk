@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html dir="rtl" lang="ar">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>سكاي درويد</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg">
+<link rel="apple-touch-icon" href="icon.svg">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { height:100%; background:#000; color:#fff; overflow:hidden;
+    font-family:system-ui,'Segoe UI',Tahoma,Arial,sans-serif; }
+  #start-screen { position:fixed; inset:0; z-index:10; background:#000;
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:22px; }
+  #start-screen h1 { font-size:30px; letter-spacing:1px; }
+  #start-screen p { color:#8a8a8a; font-size:14px; }
+  #btn-start { font-size:26px; font-weight:700; color:#000; background:#fff;
+    border:none; border-radius:999px; padding:22px 96px; cursor:pointer; }
+  #btn-start:active { transform:scale(.96); }
+  #stage { position:fixed; inset:0; display:none; background:#000; }
+  #stage.on { display:block; }
+  #stream-frame { position:absolute; inset:0; width:100%; height:100%; border:0; background:#000; }
+  #pill { position:absolute; top:calc(10px + env(safe-area-inset-top)); left:50%;
+    transform:translateX(-50%); z-index:20; direction:ltr; font-family:monospace;
+    font-size:12px; color:#4dff4d; background:rgba(15,15,15,.85);
+    border:1px solid #2a2a2a; border-radius:999px; padding:6px 14px;
+    transition:opacity .4s; white-space:nowrap; }
+  #pill.hidden { opacity:0; }
+  #pill .warn { color:#ffd23e; }
+  #pill .bad { color:#ff6b6b; }
+  #toolbar { position:absolute; bottom:calc(16px + env(safe-area-inset-bottom)); left:50%;
+    transform:translateX(-50%); z-index:20; display:flex; gap:10px;
+    background:rgba(15,15,15,.88); border:1px solid #2a2a2a; border-radius:999px;
+    padding:10px 14px; transition:opacity .4s; backdrop-filter:blur(6px); }
+  #toolbar.hidden { opacity:0; pointer-events:none; }
+  #toolbar button { width:48px; height:48px; border-radius:50%; border:1px solid #3d3d3d;
+    background:#242424; color:#fff; font-size:21px; cursor:pointer; line-height:1; }
+  #toolbar button:active { background:#3a3a3a; }
+</style>
+</head>
+<body>
+  <div id="start-screen">
+    <h1>سكاي درويد</h1>
+    <p>هاتف أندرويد سحابي — اضغط تشغيل</p>
+    <button id="btn-start">تشغيل</button>
+  </div>
+
+  <div id="stage">
+    <iframe id="stream-frame" title="SkyDroid" allow="autoplay; fullscreen"></iframe>
+    <div id="pill" class="hidden">…</div>
+    <div id="toolbar" class="hidden">
+      <button id="t-back" title="رجوع">‹</button>
+      <button id="t-home" title="الرئيسية">⌂</button>
+      <button id="t-recents" title="التطبيقات الأخيرة">▤</button>
+      <button id="t-reconnect" title="إعادة الاتصال">⟳</button>
+      <button id="t-exit" title="خروج من ملء الشاشة">⛶</button>
+    </div>
+  </div>
+
+<script>
+(function () {
+  'use strict';
+
+  // Quality ladder: bitrate 400K..3M, size 480..1080. Encoder session is
+  // restarted on-device (not the container) when stepping.
+  var Q_STEPS = [
+    { bitrate: 400000,  size: 480  },
+    { bitrate: 800000,  size: 720  },
+    { bitrate: 1500000, size: 720  },
+    { bitrate: 3000000, size: 1080 }
+  ];
+
+  var started = false;
+  var wakeLock = null;
+  var qIndex = 1;              // start at 800K / 720p
+  var goodStreak = 0;
+  var rtt = 0, curFps = 0, curBitrate = 800000;
+  var lastStatsAt = 0, streamArmedAt = 0;
+  var backoffMs = 2000, backoffTimer = null;
+
+  var frame   = document.getElementById('stream-frame');
+  var stage   = document.getElementById('stage');
+  var startScreen = document.getElementById('start-screen');
+  var toolbar = document.getElementById('toolbar');
+  var pill    = document.getElementById('pill');
+
+  function buildSrc() {
+    // Prefer WebCodecs (hardware decode, lowest latency), MSE fallback.
+    var player = (typeof VideoDecoder === 'function') ? 'webcodecs' : 'mse';
+    var proto = (location.protocol === 'https:') ? 'wss://' : 'ws://';
+    var ws = proto + location.host + '/s/?action=proxy-adb&remote=tcp:8886&udid=android:5555';
+    return '/s/#!action=stream&udid=android:5555&player=' + player +
+           '&fitToScreen=1&ws=' + encodeURIComponent(ws);
+  }
+
+  function renderPill(text) {
+    if (text) { pill.textContent = text; return; }
+    var cls = '';
+    if (rtt > 450) cls = 'bad'; else if (rtt > 200) cls = 'warn';
+    pill.innerHTML = '&#128246; <span class="' + cls + '">' + Math.round(rtt) +
+      'ms</span> &bull; ' + curFps + 'fps &bull; ' + Math.round(curBitrate / 1000) + 'k';
+  }
+
+  async function start() {
+    if (started) return;
+    started = true;
+    try { await document.documentElement.requestFullscreen({ navigationUI: 'hide' }); } catch (e) {}
+    try { if (screen.orientation && screen.orientation.lock) await screen.orientation.lock('portrait'); } catch (e) {}
+    try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+    document.addEventListener('visibilitychange', async function () {
+      if (document.visibilityState === 'visible' && navigator.wakeLock) {
+        try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+      }
+    });
+    startScreen.style.display = 'none';
+    stage.classList.add('on');
+    pill.classList.remove('hidden');
+    toolbar.classList.remove('hidden');
+    scheduleHide();
+    connect();
+    setInterval(pingApi, 2000);
+    setInterval(adapt, 2000);
+    window.addEventListener('message', onStatsMessage);
+  }
+
+  function connect() {
+    renderPill('connecting…');
+    streamArmedAt = Date.now();
+    lastStatsAt = 0;
+    frame.src = buildSrc();
+  }
+
+  function onStatsMessage(ev) {
+    var d = ev.data;
+    if (!d || d.type !== 'skydroid-stats') return;
+    lastStatsAt = Date.now();
+    curFps = d.fps || 0;
+    curBitrate = d.bitrate || curBitrate;
+    backoffMs = 2000; // healthy again — reset reconnect backoff
+    renderPill();
+  }
+
+  async function pingApi() {
+    var t0 = performance.now();
+    try {
+      var r = await fetch('/api/ping', { cache: 'no-store' });
+      if (r.ok) rtt = performance.now() - t0;
+    } catch (e) { /* keep last rtt */ }
+    renderPill();
+  }
+
+  function applyQuality() {
+    var s = Q_STEPS[qIndex];
+    try {
+      frame.contentWindow.postMessage(
+        { type: 'skydroid-quality', bitrate: s.bitrate, size: s.size }, '*');
+    } catch (e) {}
+    curBitrate = s.bitrate;
+    renderPill();
+  }
+
+  function adapt() {
+    if (!started) return;
+    var now = Date.now();
+    // Stall watchdog: stats flowing before, now silent 15s -> restart encoder session.
+    if (lastStatsAt && now - lastStatsAt > 15000) {
+      lastStatsAt = 0;
+      renderPill('restarting stream…');
+      fetch('/api/stream/restart', { method: 'POST' }).catch(function () {});
+      return;
+    }
+    // Never got stats -> reconnect with exponential backoff.
+    if (!lastStatsAt && now - streamArmedAt > 12000) {
+      streamArmedAt = now;
+      renderPill('reconnecting…');
+      if (backoffTimer) clearTimeout(backoffTimer);
+      backoffTimer = setTimeout(function () {
+        frame.src = buildSrc() + '&t=' + Date.now();
+        backoffMs = Math.min(backoffMs * 2, 30000);
+      }, backoffMs);
+      return;
+    }
+    if (!lastStatsAt) return;
+    // Adaptive quality every 2s.
+    if ((rtt > 450 || curFps < 12) && qIndex > 0) {
+      qIndex--; goodStreak = 0; applyQuality();
+    } else if (rtt < 150 && curFps >= 27 && qIndex < Q_STEPS.length - 1) {
+      if (++goodStreak >= 3) { qIndex++; goodStreak = 0; applyQuality(); }
+    } else {
+      goodStreak = 0;
+    }
+  }
+
+  // ---- toolbar ----
+  var hideTimer = null;
+  function scheduleHide() {
+    if (hideTimer) clearTimeout(hideTimer);
+    hideTimer = setTimeout(function () {
+      toolbar.classList.add('hidden');
+      pill.classList.add('hidden');
+    }, 3500);
+  }
+  function poke() {
+    toolbar.classList.remove('hidden');
+    pill.classList.remove('hidden');
+    scheduleHide();
+  }
+  stage.addEventListener('touchstart', poke, { passive: true });
+  stage.addEventListener('mousemove', poke);
+
+  function apiKey(code) {
+    fetch('/api/key/' + code, { method: 'POST' }).catch(function () {});
+    poke();
+  }
+  document.getElementById('t-back').onclick = function () { apiKey(4); };
+  document.getElementById('t-home').onclick = function () { apiKey(3); };
+  document.getElementById('t-recents').onclick = function () { apiKey(187); };
+  document.getElementById('t-reconnect').onclick = function () {
+    if (backoffTimer) clearTimeout(backoffTimer);
+    backoffMs = 2000;
+    streamArmedAt = Date.now(); lastStatsAt = 0;
+    frame.src = buildSrc() + '&t=' + Date.now();
+    poke();
+  };
+  document.getElementById('t-exit').onclick = function () {
+    try { document.exitFullscreen(); } catch (e) {}
+    poke();
+  };
+
+  document.getElementById('btn-start').addEventListener('click', start);
+
+  // Installed PWA (display: fullscreen) -> start instantly, no tap.
+  if (window.matchMedia && window.matchMedia('(display-mode: fullscreen)').matches) {
+    start();
+  }
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(function () {});
+  }
+})();
+</script>
+</body>
+</html>

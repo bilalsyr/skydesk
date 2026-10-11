@@ -1,0 +1,5 @@
+# generated / local-only
+.env
+data/
+tunnel.log
+*.log
